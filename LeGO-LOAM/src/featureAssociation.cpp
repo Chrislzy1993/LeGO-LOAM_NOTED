@@ -60,8 +60,9 @@ private:
   pcl::PointCloud<PointType>::Ptr surfPointsLessFlatScan;
   pcl::PointCloud<PointType>::Ptr surfPointsLessFlatScanDS;
 
-  pcl::VoxelGrid<PointType> downSizeFilter;
-
+  pcl::VoxelGrid<PointType> downSizeFilter; // 降采样
+  
+  // 用于同步
   double timeScanCur;
   double timeNewSegmentedCloud;
   double timeNewSegmentedCloudInfo;
@@ -73,7 +74,8 @@ private:
 
   cloud_msgs::cloud_info segInfo;
   std_msgs::Header cloudHeader;
-
+  
+  // 系统初始化
   int systemInitCount;
   bool systemInited;
 
@@ -81,28 +83,32 @@ private:
   float *cloudCurvature; // 曲率
   int *cloudNeighborPicked;
   int *cloudLabel;
-
-  int imuPointerFront;
-  int imuPointerLast;
+  
+  // imu循环队列的索引
+  int imuPointerFront; // 刚大于点云时刻的imu消息索引
+  int imuPointerLast; // 最新imu消息索引
   int imuPointerLastIteration;
-
-  float imuRollStart, imuPitchStart, imuYawStart;
+  
+  // 点云时刻imu消息（PVA信息）
+  float imuRollStart, imuPitchStart, imuYawStart; // 第一个点云点的时刻
   float cosImuRollStart, cosImuPitchStart, cosImuYawStart, sinImuRollStart, sinImuPitchStart, sinImuYawStart;
-  float imuRollCur, imuPitchCur, imuYawCur;
+  float imuRollCur, imuPitchCur, imuYawCur; //当前点云点时刻
 
   float imuVeloXStart, imuVeloYStart, imuVeloZStart;
-  float imuShiftXStart, imuShiftYStart, imuShiftZStart;
-
   float imuVeloXCur, imuVeloYCur, imuVeloZCur;
-  float imuShiftXCur, imuShiftYCur, imuShiftZCur;
 
+  float imuShiftXStart, imuShiftYStart, imuShiftZStart;
+  float imuShiftXCur, imuShiftYCur, imuShiftZCur;
+  
+  // 当前点时刻到起始点时刻的PVA差
   float imuShiftFromStartXCur, imuShiftFromStartYCur, imuShiftFromStartZCur;
   float imuVeloFromStartXCur, imuVeloFromStartYCur, imuVeloFromStartZCur;
+  float imuAngularFromStartX, imuAngularFromStartY, imuAngularFromStartZ;
 
   float imuAngularRotationXCur, imuAngularRotationYCur, imuAngularRotationZCur;
   float imuAngularRotationXLast, imuAngularRotationYLast, imuAngularRotationZLast;
-  float imuAngularFromStartX, imuAngularFromStartY, imuAngularFromStartZ;
-
+  
+  // 循环队列
   double imuTime[imuQueLength];
   float imuRoll[imuQueLength];
   float imuPitch[imuQueLength];
@@ -349,7 +355,7 @@ public:
     laserOdometryTrans.frame_id_ = "/camera_init";
     laserOdometryTrans.child_frame_id_ = "/laser_odom";
     
-    // 退化
+    // 退化?????
     isDegenerate = false;
     matP = cv::Mat(6, 6, CV_32F, cv::Scalar::all(0));
 
@@ -502,6 +508,7 @@ public:
     PointType point;
     for (int i = 0; i < cloudSize; i++)
     {
+      // 方向变了，变成了imu的方向
       point.x = segmentedCloud->points[i].y;
       point.y = segmentedCloud->points[i].z;
       point.z = segmentedCloud->points[i].x;
@@ -623,7 +630,6 @@ public:
             imuAngularRotationYCur = imuAngularRotationY[imuPointerFront] * ratioFront + imuAngularRotationY[imuPointerBack] * ratioBack;
             imuAngularRotationZCur = imuAngularRotationZ[imuPointerFront] * ratioFront + imuAngularRotationZ[imuPointerBack] * ratioBack;
           }
-
           imuAngularFromStartX = imuAngularRotationXCur - imuAngularRotationXLast;
           imuAngularFromStartY = imuAngularRotationYCur - imuAngularRotationYLast;
           imuAngularFromStartZ = imuAngularRotationZCur - imuAngularRotationZLast;
@@ -636,7 +642,7 @@ public:
         }
         else
         {
-          // 运动补偿
+          // 运动补偿？？？
           VeloToStartIMU();
           TransformToStartIMU(&point);
         }
@@ -1494,7 +1500,7 @@ public:
     return true;
   }
 
-  // 8.2 计算基于平面点特征的优化
+  // 8.2 计算基于平面点特征的优化，优化t_z, roll, pitch
   bool calculateTransformationSurf(int iterCount)
   {
     int pointSelNum = laserCloudOri->points.size();
@@ -1541,7 +1547,8 @@ public:
     float c7 = b2;
     float c8 = -b1;
     float c9 = tx * -b2 - ty * -b1;
-
+    
+    // 计算matA和matB矩阵
     for (int i = 0; i < pointSelNum; i++)
     {
       pointOri = laserCloudOri->points[i];
@@ -1560,21 +1567,24 @@ public:
     cv::transpose(matA, matAt);
     matAtA = matAt * matA;
     matAtB = matAt * matB;
+    //求解matAtA * matX = matAtB
     cv::solve(matAtA, matAtB, matX, cv::DECOMP_QR);
 
     if (iterCount == 0)
     {
+      // 特征值1*3矩阵
       cv::Mat matE(1, 3, CV_32F, cv::Scalar::all(0));
+      // 特征向量6*6矩阵
       cv::Mat matV(3, 3, CV_32F, cv::Scalar::all(0));
       cv::Mat matV2(3, 3, CV_32F, cv::Scalar::all(0));
-
+      // 求取特征值特征向量
       cv::eigen(matAtA, matE, matV);
       matV.copyTo(matV2);
-
       isDegenerate = false;
       float eignThre[3] = {10, 10, 10};
       for (int i = 2; i >= 0; i--)
       {
+        // 特征值太小，发生了退化
         if (matE.at<float>(0, i) < eignThre[i])
         {
           for (int j = 0; j < 3; j++)
@@ -1588,16 +1598,17 @@ public:
           break;
         }
       }
+      // 计算P矩阵
       matP = matV.inv() * matV2;
     }
 
     if (isDegenerate)
     {
+      // 如果发生退化，只使用预测矩阵P计算
       cv::Mat matX2(3, 1, CV_32F, cv::Scalar::all(0));
       matX.copyTo(matX2);
       matX = matP * matX2;
     }
-
     transformCur[0] += matX.at<float>(0, 0);
     transformCur[2] += matX.at<float>(1, 0);
     transformCur[4] += matX.at<float>(2, 0);
@@ -1621,7 +1632,7 @@ public:
     return true;
   }
   
-  // 8.3: 计算基于边缘点特征的优化
+  // 8.3: 计算基于边缘点特征的优化t_x, t_y, yaw
   bool calculateTransformationCorner(int iterCount)
   {
     int pointSelNum = laserCloudOri->points.size();

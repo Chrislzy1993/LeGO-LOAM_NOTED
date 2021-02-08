@@ -711,36 +711,34 @@ public:
 
   void visualizeGlobalMapThread()
   {
+    // pub全局地图，当前位姿附近的关键帧的地图，包括特征地图和无效点地图
     ros::Rate rate(0.2);
     while (ros::ok())
     {
       rate.sleep();
       publishGlobalMap();
     }
-    // save final point cloud
+    // 保存特征点云和轨迹点云
     pcl::io::savePCDFileASCII(fileDirectory + "finalCloud.pcd", *globalMapKeyFramesDS);
-
     string cornerMapString = "/tmp/cornerMap.pcd";
     string surfaceMapString = "/tmp/surfaceMap.pcd";
     string trajectoryString = "/tmp/trajectory.pcd";
-
     pcl::PointCloud<PointType>::Ptr cornerMapCloud(new pcl::PointCloud<PointType>());
     pcl::PointCloud<PointType>::Ptr cornerMapCloudDS(new pcl::PointCloud<PointType>());
     pcl::PointCloud<PointType>::Ptr surfaceMapCloud(new pcl::PointCloud<PointType>());
     pcl::PointCloud<PointType>::Ptr surfaceMapCloudDS(new pcl::PointCloud<PointType>());
-
     for (int i = 0; i < cornerCloudKeyFrames.size(); i++)
     {
       *cornerMapCloud += *transformPointCloud(cornerCloudKeyFrames[i], &cloudKeyPoses6D->points[i]);
       *surfaceMapCloud += *transformPointCloud(surfCloudKeyFrames[i], &cloudKeyPoses6D->points[i]);
       *surfaceMapCloud += *transformPointCloud(outlierCloudKeyFrames[i], &cloudKeyPoses6D->points[i]);
     }
-
+    // 对特征地图进行降采样处理
     downSizeFilterCorner.setInputCloud(cornerMapCloud);
     downSizeFilterCorner.filter(*cornerMapCloudDS);
     downSizeFilterSurf.setInputCloud(surfaceMapCloud);
     downSizeFilterSurf.filter(*surfaceMapCloudDS);
-
+    // 保存特征地图和特征点
     pcl::io::savePCDFileASCII(fileDirectory + "cornerMap.pcd", *cornerMapCloudDS);
     pcl::io::savePCDFileASCII(fileDirectory + "surfaceMap.pcd", *surfaceMapCloudDS);
     pcl::io::savePCDFileASCII(fileDirectory + "trajectory.pcd", *cloudKeyPoses3D);
@@ -748,27 +746,24 @@ public:
 
   void publishGlobalMap()
   {
-
     if (pubLaserCloudSurround.getNumSubscribers() == 0)
       return;
-
     if (cloudKeyPoses3D->points.empty() == true)
       return;
-    // kd-tree to find near key frames to visualize
+    // 根据kdtree搜索最近关键帧的位置点云
     std::vector<int> pointSearchIndGlobalMap;
     std::vector<float> pointSearchSqDisGlobalMap;
-    // search near key frames to visualize
     mtx.lock();
     kdtreeGlobalMap->setInputCloud(cloudKeyPoses3D);
     kdtreeGlobalMap->radiusSearch(currentRobotPosPoint, globalMapVisualizationSearchRadius, pointSearchIndGlobalMap, pointSearchSqDisGlobalMap, 0);
     mtx.unlock();
-
+    
+    // 对最近关键帧的位置点云进行降采样吹
     for (int i = 0; i < pointSearchIndGlobalMap.size(); ++i)
       globalMapKeyPoses->points.push_back(cloudKeyPoses3D->points[pointSearchIndGlobalMap[i]]);
-    // downsample near selected key frames
     downSizeFilterGlobalMapKeyPoses.setInputCloud(globalMapKeyPoses);
     downSizeFilterGlobalMapKeyPoses.filter(*globalMapKeyPosesDS);
-    // extract visualized and downsampled key frames
+    // 提取最近关键帧的点云并形成点云地图（包括特征点点云，平面点点云，和无效点点云）
     for (int i = 0; i < globalMapKeyPosesDS->points.size(); ++i)
     {
       int thisKeyInd = (int)globalMapKeyPosesDS->points[i].intensity;
@@ -776,10 +771,11 @@ public:
       *globalMapKeyFrames += *transformPointCloud(surfCloudKeyFrames[thisKeyInd], &cloudKeyPoses6D->points[thisKeyInd]);
       *globalMapKeyFrames += *transformPointCloud(outlierCloudKeyFrames[thisKeyInd], &cloudKeyPoses6D->points[thisKeyInd]);
     }
-    // downsample visualized points
+    // 对最近点云地图进行降采样处理
     downSizeFilterGlobalMapKeyFrames.setInputCloud(globalMapKeyFrames);
     downSizeFilterGlobalMapKeyFrames.filter(*globalMapKeyFramesDS);
-
+    
+    // pub点云地图
     sensor_msgs::PointCloud2 cloudMsgTemp;
     pcl::toROSMsg(*globalMapKeyFramesDS, cloudMsgTemp);
     cloudMsgTemp.header.stamp = ros::Time().fromSec(timeLaserOdometry);
@@ -794,10 +790,9 @@ public:
 
   void loopClosureThread()
   {
-
     if (loopClosureEnableFlag == false)
       return;
-
+    // 回环检测的频率为1Hz  
     ros::Rate rate(1);
     while (ros::ok())
     {
@@ -806,9 +801,79 @@ public:
     }
   }
 
+  void performLoopClosure()
+  {
+    if (cloudKeyPoses3D->points.empty() == true)
+      return;
+    // 检测回环
+    if (potentialLoopFlag == false)
+    {
+      if (detectLoopClosure() == true)
+      {
+        potentialLoopFlag = true; // find some key frames that is old enough or close enough for loop closure
+        timeSaveFirstCurrentScanForLoopClosure = timeLaserOdometry;
+      }
+      if (potentialLoopFlag == false)
+        return;
+    }
+    // 使用ICP匹配判断回环检测是否成功，如果成功则矫正位姿
+    potentialLoopFlag = false;
+    pcl::IterativeClosestPoint<PointType, PointType> icp;
+    icp.setMaxCorrespondenceDistance(100);
+    icp.setMaximumIterations(100);
+    icp.setTransformationEpsilon(1e-6);
+    icp.setEuclideanFitnessEpsilon(1e-6);
+    icp.setRANSACIterations(0);
+    icp.setInputSource(latestSurfKeyFrameCloud);
+    icp.setInputTarget(nearHistorySurfKeyFrameCloudDS);
+    pcl::PointCloud<PointType>::Ptr unused_result(new pcl::PointCloud<PointType>());
+    icp.align(*unused_result);
+    if (icp.hasConverged() == false || icp.getFitnessScore() > historyKeyframeFitnessScore) // 根据是否收敛和匹配得分来判断回环是否准确
+      return;
+    // 发布点云
+    if (pubIcpKeyFrames.getNumSubscribers() != 0)
+    {
+      pcl::PointCloud<PointType>::Ptr closed_cloud(new pcl::PointCloud<PointType>());
+      pcl::transformPointCloud(*latestSurfKeyFrameCloud, *closed_cloud, icp.getFinalTransformation());
+      sensor_msgs::PointCloud2 cloudMsgTemp;
+      pcl::toROSMsg(*closed_cloud, cloudMsgTemp);
+      cloudMsgTemp.header.stamp = ros::Time().fromSec(timeLaserOdometry);
+      cloudMsgTemp.header.frame_id = "/camera_init";
+      pubIcpKeyFrames.publish(cloudMsgTemp);
+    }
+    /*
+        	get pose constraint
+        	*/
+    float x, y, z, roll, pitch, yaw;
+    Eigen::Affine3f correctionCameraFrame;
+    correctionCameraFrame = icp.getFinalTransformation(); // get transformation in camera frame (because points are in camera frame)
+    pcl::getTranslationAndEulerAngles(correctionCameraFrame, x, y, z, roll, pitch, yaw);
+    Eigen::Affine3f correctionLidarFrame = pcl::getTransformation(z, x, y, yaw, roll, pitch);
+    // transform from world origin to wrong pose
+    Eigen::Affine3f tWrong = pclPointToAffine3fCameraToLidar(cloudKeyPoses6D->points[latestFrameIDLoopCloure]);
+    // transform from world origin to corrected pose
+    Eigen::Affine3f tCorrect = correctionLidarFrame * tWrong; // pre-multiplying -> successive rotation about a fixed frame
+    pcl::getTranslationAndEulerAngles(tCorrect, x, y, z, roll, pitch, yaw);
+    gtsam::Pose3 poseFrom = Pose3(Rot3::RzRyRx(roll, pitch, yaw), Point3(x, y, z));
+    gtsam::Pose3 poseTo = pclPointTogtsamPose3(cloudKeyPoses6D->points[closestHistoryFrameID]);
+    gtsam::Vector Vector6(6);
+    float noiseScore = icp.getFitnessScore();
+    Vector6 << noiseScore, noiseScore, noiseScore, noiseScore, noiseScore, noiseScore;
+    constraintNoise = noiseModel::Diagonal::Variances(Vector6);
+    /* 
+        	add constraints
+        	*/
+    std::lock_guard<std::mutex> lock(mtx);
+    gtSAMgraph.add(BetweenFactor<Pose3>(latestFrameIDLoopCloure, closestHistoryFrameID, poseFrom.between(poseTo), constraintNoise));
+    isam->update(gtSAMgraph);
+    isam->update();
+    gtSAMgraph.resize(0);
+
+    aLoopIsClosed = true;
+  }
+
   bool detectLoopClosure()
   {
-
     latestSurfKeyFrameCloud->clear();
     nearHistorySurfKeyFrameCloud->clear();
     nearHistorySurfKeyFrameCloudDS->clear();
@@ -872,82 +937,6 @@ public:
     }
 
     return true;
-  }
-
-  void performLoopClosure()
-  {
-
-    if (cloudKeyPoses3D->points.empty() == true)
-      return;
-    // try to find close key frame if there are any
-    if (potentialLoopFlag == false)
-    {
-
-      if (detectLoopClosure() == true)
-      {
-        potentialLoopFlag = true; // find some key frames that is old enough or close enough for loop closure
-        timeSaveFirstCurrentScanForLoopClosure = timeLaserOdometry;
-      }
-      if (potentialLoopFlag == false)
-        return;
-    }
-    // reset the flag first no matter icp successes or not
-    potentialLoopFlag = false;
-    // ICP Settings
-    pcl::IterativeClosestPoint<PointType, PointType> icp;
-    icp.setMaxCorrespondenceDistance(100);
-    icp.setMaximumIterations(100);
-    icp.setTransformationEpsilon(1e-6);
-    icp.setEuclideanFitnessEpsilon(1e-6);
-    icp.setRANSACIterations(0);
-    // Align clouds
-    icp.setInputSource(latestSurfKeyFrameCloud);
-    icp.setInputTarget(nearHistorySurfKeyFrameCloudDS);
-    pcl::PointCloud<PointType>::Ptr unused_result(new pcl::PointCloud<PointType>());
-    icp.align(*unused_result);
-
-    if (icp.hasConverged() == false || icp.getFitnessScore() > historyKeyframeFitnessScore)
-      return;
-    // publish corrected cloud
-    if (pubIcpKeyFrames.getNumSubscribers() != 0)
-    {
-      pcl::PointCloud<PointType>::Ptr closed_cloud(new pcl::PointCloud<PointType>());
-      pcl::transformPointCloud(*latestSurfKeyFrameCloud, *closed_cloud, icp.getFinalTransformation());
-      sensor_msgs::PointCloud2 cloudMsgTemp;
-      pcl::toROSMsg(*closed_cloud, cloudMsgTemp);
-      cloudMsgTemp.header.stamp = ros::Time().fromSec(timeLaserOdometry);
-      cloudMsgTemp.header.frame_id = "/camera_init";
-      pubIcpKeyFrames.publish(cloudMsgTemp);
-    }
-    /*
-        	get pose constraint
-        	*/
-    float x, y, z, roll, pitch, yaw;
-    Eigen::Affine3f correctionCameraFrame;
-    correctionCameraFrame = icp.getFinalTransformation(); // get transformation in camera frame (because points are in camera frame)
-    pcl::getTranslationAndEulerAngles(correctionCameraFrame, x, y, z, roll, pitch, yaw);
-    Eigen::Affine3f correctionLidarFrame = pcl::getTransformation(z, x, y, yaw, roll, pitch);
-    // transform from world origin to wrong pose
-    Eigen::Affine3f tWrong = pclPointToAffine3fCameraToLidar(cloudKeyPoses6D->points[latestFrameIDLoopCloure]);
-    // transform from world origin to corrected pose
-    Eigen::Affine3f tCorrect = correctionLidarFrame * tWrong; // pre-multiplying -> successive rotation about a fixed frame
-    pcl::getTranslationAndEulerAngles(tCorrect, x, y, z, roll, pitch, yaw);
-    gtsam::Pose3 poseFrom = Pose3(Rot3::RzRyRx(roll, pitch, yaw), Point3(x, y, z));
-    gtsam::Pose3 poseTo = pclPointTogtsamPose3(cloudKeyPoses6D->points[closestHistoryFrameID]);
-    gtsam::Vector Vector6(6);
-    float noiseScore = icp.getFitnessScore();
-    Vector6 << noiseScore, noiseScore, noiseScore, noiseScore, noiseScore, noiseScore;
-    constraintNoise = noiseModel::Diagonal::Variances(Vector6);
-    /* 
-        	add constraints
-        	*/
-    std::lock_guard<std::mutex> lock(mtx);
-    gtSAMgraph.add(BetweenFactor<Pose3>(latestFrameIDLoopCloure, closestHistoryFrameID, poseFrom.between(poseTo), constraintNoise));
-    isam->update(gtSAMgraph);
-    isam->update();
-    gtSAMgraph.resize(0);
-
-    aLoopIsClosed = true;
   }
 
   Pose3 pclPointTogtsamPose3(PointTypePose thisPoint)
@@ -1587,10 +1576,12 @@ int main(int argc, char **argv)
   ros::init(argc, argv, "lego_loam");
   ROS_INFO("\033[1;32m---->\033[0m Map Optimization Started.");
   mapOptimization MO;
-
+  
+  // 两个线程，一个用于回环检测，另一个用于地图可视化
   std::thread loopthread(&mapOptimization::loopClosureThread, &MO); // 回环检测线程
   std::thread visualizeMapThread(&mapOptimization::visualizeGlobalMapThread, &MO); // 全局地图可视化线程
-
+  
+  // 主线程
   ros::Rate rate(200);
   while (ros::ok())
   {
